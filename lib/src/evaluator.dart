@@ -34,6 +34,7 @@ class SafeExpressionEvaluator {
     }
     final parser =
         _ExpressionParser(_Scanner(source, span).scan(), helpers, scope, span);
+    parser.options = options;
     return parser.parse();
   }
 
@@ -51,21 +52,56 @@ class SafeExpressionEvaluator {
         span,
       );
     }
+    final expression = _withoutQuotedStrings(source);
     final unsupported = [
       RegExp(r'\bnew\s+'),
-      RegExp(r'=>'),
       RegExp(r'\bfunction\b'),
-      RegExp(r'\b(var|let|const)\b'),
       RegExp(r'\b(Date|moment)\s*\.'),
     ];
     for (final pattern in unsupported) {
-      if (pattern.hasMatch(source)) {
+      if (pattern.hasMatch(expression)) {
         throw UnsupportedFeatureException(
           'Unsupported JavaScript expression "$source"; precompute it in Dart locals or expose an explicit helper.',
           span,
         );
       }
     }
+    if (RegExp(r'=>').hasMatch(source) && !options.nodeMigrationEnabled) {
+      throw UnsupportedFeatureException(
+        'Unsupported JavaScript expression "$source"; precompute it in Dart locals or expose an explicit helper.',
+        span,
+      );
+    }
+    if (!options.nodeMigrationEnabled) {
+      if (RegExp(r'\b(var|let|const)\b').hasMatch(source)) {
+        throw UnsupportedFeatureException(
+          'Unsupported JavaScript expression "$source"; precompute it in Dart locals or expose an explicit helper.',
+          span,
+        );
+      }
+    }
+  }
+
+  String _withoutQuotedStrings(String source) {
+    final buffer = StringBuffer();
+    String? quote;
+    for (var i = 0; i < source.length; i++) {
+      final char = source[i];
+      if (quote != null) {
+        if (char == r'\') {
+          i++;
+        } else if (char == quote) {
+          quote = null;
+        }
+        buffer.write(' ');
+      } else if (char == '"' || char == "'") {
+        quote = char;
+        buffer.write(' ');
+      } else {
+        buffer.write(char);
+      }
+    }
+    return buffer.toString();
   }
 
   String _evaluateTemplateLiteral(
@@ -91,13 +127,20 @@ class SafeExpressionEvaluator {
       } else if (char == r'$' && i + 1 < body.length && body[i + 1] == '{') {
         final end = _findTemplateExpressionEnd(body, i + 2, span);
         final expression = body.substring(i + 2, end);
-        buffer.write(evaluate(expression, scope, span)?.toString() ?? '');
+        buffer.write(_stringify(evaluate(expression, scope, span)));
         i = end;
       } else {
         buffer.write(char);
       }
     }
     return buffer.toString();
+  }
+
+  String _stringify(Object? value) {
+    if (value is num && value.isFinite && value == value.truncate()) {
+      return value.toInt().toString();
+    }
+    return value?.toString() ?? '';
   }
 
   int _findTemplateExpressionEnd(
@@ -145,6 +188,7 @@ class _ExpressionParser {
   final Map<String, PugHelper> helpers;
   final EvalScope scope;
   final PugSourceSpan? span;
+  late PugOptions options;
   int index = 0;
 
   Object? parse() {
@@ -254,7 +298,9 @@ class _ExpressionParser {
     while (true) {
       if (_match('.')) {
         final name = _consumeIdentifier();
-        if (_check('(') && name == 'toString') {
+        if (_check('(') && name == 'map') {
+          value = _parseMapArrow(value);
+        } else if (_check('(') && name == 'toString') {
           final target = value;
           value = (List<Object?> args) => target?.toString();
         } else if (_check('(') && name == 'toFixed') {
@@ -305,7 +351,81 @@ class _ExpressionParser {
     }
   }
 
+  Object? _parseMapArrow(Object? target) {
+    index++;
+    if (!_check('(')) {
+      index--;
+      return _lookupProperty(target, 'map');
+    }
+    index++;
+    final paramToken = _advance();
+    if (paramToken.type != _TokenType.identifier) {
+      throw PugRenderException('Expected arrow parameter', span);
+    }
+    final paramName = paramToken.lexeme;
+    _consume(')');
+    _consume('=>');
+    var depth = 1;
+    var i = index;
+    while (i < tokens.length && depth > 0) {
+      final t = tokens[i];
+      if (t.type == _TokenType.eof) {
+        throw PugRenderException('Unterminated .map body', span);
+      }
+      if (t.lexeme == '(' || t.lexeme == '[' || t.lexeme == '{') {
+        depth++;
+      } else if (t.lexeme == ')' || t.lexeme == ']' || t.lexeme == '}') {
+        depth--;
+      }
+      i++;
+    }
+    if (depth != 0) {
+      throw PugRenderException('Unterminated .map body', span);
+    }
+    final bodyTokens = tokens.sublist(index, i - 1);
+    index = i;
+    final buffer = StringBuffer();
+    for (final t in bodyTokens) {
+      if (t.type == _TokenType.template) {
+        buffer.write(t.lexeme);
+      } else if (t.literal is String) {
+        buffer.write("'${t.literal}'");
+      } else {
+        buffer.write(t.lexeme);
+      }
+      buffer.write(' ');
+    }
+    final bodySource = buffer.toString().trim();
+    if (target is! Iterable) return const [];
+    final evaluator =
+        SafeExpressionEvaluator(helpers: helpers, options: options);
+    return target
+        .map((item) => evaluator.evaluate(
+              bodySource,
+              scope.child({paramName: item}),
+              span,
+            ))
+        .toList();
+  }
+
   Object? _primary() {
+    final peek = tokens[index];
+    if (peek.type == _TokenType.template) {
+      index++;
+      final body = peek.literal as String;
+      final parts = body.split('\u0001');
+      final buffer = StringBuffer();
+      for (var i = 0; i < parts.length; i++) {
+        if (i.isEven) {
+          buffer.write(parts[i]);
+        } else {
+          final sub =
+              SafeExpressionEvaluator(helpers: helpers, options: options);
+          buffer.write(sub._stringify(sub.evaluate(parts[i], scope, span)));
+        }
+      }
+      return buffer.toString();
+    }
     if (_match('(')) {
       final value = _ternary();
       _consume(')');
@@ -314,9 +434,10 @@ class _ExpressionParser {
     if (_match('[')) {
       final values = <Object?>[];
       if (!_check(']')) {
-        do {
+        while (true) {
           values.add(_ternary());
-        } while (_match(','));
+          if (!_match(',') || _check(']')) break;
+        }
       }
       _consume(']');
       return values;
@@ -324,12 +445,13 @@ class _ExpressionParser {
     if (_match('{')) {
       final map = <String, Object?>{};
       if (!_check('}')) {
-        do {
+        while (true) {
           final keyToken = _advance();
           final key = keyToken.literal ?? keyToken.lexeme;
           _consume(':');
           map[key.toString()] = _ternary();
-        } while (_match(','));
+          if (!_match(',') || _check('}')) break;
+        }
       }
       _consume('}');
       return map;
@@ -440,12 +562,53 @@ class _Scanner {
         _identifier();
       } else if (char == '"' || char == "'") {
         _string(char);
+      } else if (char == '`') {
+        _templateString();
       } else {
         _operator();
       }
     }
     tokens.add(const _Token(_TokenType.eof, '', null));
     return tokens;
+  }
+
+  /// Scans a template literal as a single token. The token's `literal` holds
+  /// the body with `${...}` placeholders replaced by a sentinel, and the
+  /// `lexeme` holds the raw text including backticks. The evaluator detects
+  /// the sentinel and re-parses the inner expressions.
+  void _templateString() {
+    final start = index;
+    index++; // skip opening backtick
+    final body = StringBuffer();
+    while (index < source.length && source[index] != '`') {
+      if (source[index] == r'\') {
+        index++;
+        if (index >= source.length) break;
+        body.write(source[index++]);
+      } else if (source[index] == r'$' &&
+          index + 1 < source.length &&
+          source[index + 1] == '{') {
+        // Find matching `}`.
+        var depth = 1;
+        index += 2;
+        final exprStart = index;
+        while (index < source.length && depth > 0) {
+          if (source[index] == '{') {
+            depth++;
+          } else if (source[index] == '}') {
+            depth--;
+          }
+          index++;
+        }
+        final expr = source.substring(exprStart, index - 1);
+        body.write('\u0001$expr\u0001');
+      } else {
+        body.write(source[index++]);
+      }
+    }
+    index++; // skip closing backtick
+    final raw = source.substring(start, index);
+    tokens.add(_Token(_TokenType.template, raw, body.toString()));
   }
 
   void _number() {
@@ -505,9 +668,19 @@ class _Scanner {
         return;
       }
     }
+    // Arrow function `=>` (only valid inside `.map((x) => ...)` bodies).
+    if (source.startsWith('=>', index)) {
+      tokens.add(const _Token(_TokenType.operator, '=>', null));
+      index += 2;
+      return;
+    }
     final char = source[index++];
     if ('+-*/%<>()[]{}?:,.!'.contains(char)) {
       tokens.add(_Token(_TokenType.operator, char, null));
+      return;
+    }
+    if (char == '=') {
+      tokens.add(const _Token(_TokenType.operator, '=', null));
       return;
     }
     throw UnsupportedFeatureException(
@@ -520,7 +693,7 @@ class _Scanner {
   bool _isIdentifierPart(String char) => RegExp(r'[\w$-]').hasMatch(char);
 }
 
-enum _TokenType { identifier, number, string, operator, eof }
+enum _TokenType { identifier, number, string, template, operator, eof }
 
 class _Token {
   const _Token(this.type, this.lexeme, this.literal);

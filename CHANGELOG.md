@@ -1,3 +1,15 @@
+## 2.1.0
+
+- Added support for multi-line unbuffered assignments such as
+  `-\n  var slides = [ ... ]` in `nodeMigration` compatibility mode.
+- Added support for list `.map((item) => expression)` arrow functions in
+  `nodeMigration` compatibility mode.
+- Added support for reassigning existing locals through unbuffered code, e.g.
+  `- alt = alt || name`.
+- Added support for hyphenated mixin names and mixin-call attributes, IDs, and
+  classes.
+- Added support for including non-Pug files as raw text.
+
 ## 2.0.1
 
 - Added `PugCompatibility.nodeMigration` for common safe Pug.js migration

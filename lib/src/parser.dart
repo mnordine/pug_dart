@@ -129,7 +129,7 @@ class PugParser {
       return _parseFilter(span, trimmed, indent);
     }
     if (trimmed.startsWith('-')) {
-      return _parseUnbufferedCode(span, trimmed);
+      return _parseUnbufferedCode(span, trimmed, indent);
     }
     final expansion = _findBlockExpansion(trimmed);
     if (expansion != -1) {
@@ -138,17 +138,110 @@ class PugParser {
     return _parseTag(span, trimmed, indent);
   }
 
-  PugNode _parseUnbufferedCode(PugSourceSpan span, String trimmed) {
-    final match =
-        RegExp(r'^-\s*(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*(.+)$')
-            .firstMatch(trimmed);
-    if (match != null) {
-      return LocalAssignmentNode(span, match.group(1)!, match.group(2)!.trim());
+  PugNode _parseUnbufferedCode(
+      PugSourceSpan span, String trimmed, int indent) {
+    var body = trimmed.substring(1).trim();
+    if (body.isEmpty) body = _readUnbufferedCodeBlock(indent);
+    final stripped = _stripTrailingSemicolon(body);
+    if (stripped != null) body = stripped;
+    final declared =
+        RegExp(r'^(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*(.*)$')
+            .firstMatch(body);
+    if (declared != null) {
+      final expression =
+          _completeMultiLineExpression(declared.group(2)!.trim(), indent);
+      return LocalAssignmentNode(span, declared.group(1)!, expression);
+    }
+    final reassigned =
+        RegExp(r'^([A-Za-z_$][\w$]*)\s*=\s*(.*)$').firstMatch(body);
+    if (reassigned != null) {
+      final expression =
+          _completeMultiLineExpression(reassigned.group(2)!.trim(), indent);
+      return LocalAssignmentNode(span, reassigned.group(1)!, expression);
     }
     throw UnsupportedFeatureException(
-      'Unbuffered JavaScript code is not supported; only simple var/let/const assignments can be enabled for migration.',
+      'Unbuffered JavaScript code is not supported; only simple '
+      'var/let/const assignments can be enabled for migration.',
       span,
     );
+  }
+
+  /// Removes a trailing `;` from a statement, e.g. `- const x = 1;`.
+  String? _stripTrailingSemicolon(String source) {
+    if (!source.endsWith(';')) return null;
+    return source.substring(0, source.length - 1);
+  }
+
+  String _readUnbufferedCodeBlock(int parentIndent) {
+    final childIndent = _nextIndent();
+    if (childIndent == null || childIndent <= parentIndent) {
+      throw PugParseException(
+          'Expected indented code after -', _lineSpan(_index - 1));
+    }
+    final buffer = StringBuffer();
+    while (_index < _lines.length) {
+      final line = _lines[_index];
+      if (line.trim().isEmpty) {
+        _index++;
+        continue;
+      }
+      if (_indent(line) < childIndent) break;
+      if (buffer.isNotEmpty) buffer.write(' ');
+      buffer.write(line.substring(childIndent).trim());
+      _index++;
+    }
+    return buffer.toString();
+  }
+
+  /// Joins continuation lines of a multi-line unbuffered expression, such as:
+  /// ```pug
+  /// -
+  ///   var slides = [
+  ///     { title: 'a' }
+  ///   ]
+  /// ```
+  String _completeMultiLineExpression(String first, int indent) {
+    var expression = first;
+    while (_expressionIsIncomplete(expression)) {
+      if (_index >= _lines.length) {
+        throw PugParseException(
+            'Unterminated expression in unbuffered code', _lineSpan(_index - 1));
+      }
+      final next = _lines[_index];
+      if (next.trim().isEmpty) {
+        _index++;
+        continue;
+      }
+      final currentIndent = _indent(next);
+      if (currentIndent <= indent) break;
+      expression = '$expression ${next.trim()}';
+      _index++;
+    }
+    return expression;
+  }
+
+  bool _expressionIsIncomplete(String expression) {
+    var depth = 0;
+    String? quote;
+    for (var i = 0; i < expression.length; i++) {
+      final char = expression[i];
+      if (quote != null) {
+        if (char == r'\') {
+          i++;
+        } else if (char == quote) {
+          quote = null;
+        }
+        continue;
+      }
+      if (char == '"' || char == "'") {
+        quote = char;
+      } else if ('([{'.contains(char)) {
+        depth++;
+      } else if (')]}'.contains(char)) {
+        depth--;
+      }
+    }
+    return depth > 0 || quote != null;
   }
 
   EachNode _parseEach(PugSourceSpan span, String trimmed, int indent) {
@@ -170,25 +263,33 @@ class PugParser {
 
   MixinDeclarationNode _parseMixin(
       PugSourceSpan span, String trimmed, int indent) {
-    final match = RegExp(r'^mixin\s+([A-Za-z_$][\w$]*)(?:\((.*)\))?$')
-        .firstMatch(trimmed);
-    if (match == null) {
+    final nameMatch =
+        RegExp(r'^mixin\s+([A-Za-z_$][\w$-]*)').firstMatch(trimmed);
+    if (nameMatch == null) {
       throw PugParseException('Invalid mixin declaration', span);
     }
-    final params = _splitTopLevel(match.group(2) ?? '')
-        .where((part) => part.trim().isNotEmpty)
+    final name = nameMatch.group(1)!;
+    final afterName = trimmed.substring(nameMatch.end).trimLeft();
+    var params = <String>[];
+    if (afterName.startsWith('(')) {
+      final result = _readBalanced(afterName, 0, '(', ')');
+      params = _splitTopLevel(result.content)
+          .where((part) => part.trim().isNotEmpty)
+          .toList();
+    }
+    final paramNodes = params
         .map((part) {
       final pieces = _splitAssignment(part);
       return MixinParam(pieces.$1.trim(), pieces.$2?.trim());
     }).toList();
     return MixinDeclarationNode(
-        span, match.group(1)!, params, _parseNestedBlock(indent));
+        span, name, paramNodes, _parseNestedBlock(indent));
   }
 
   MixinCallNode _parseMixinCall(
       PugSourceSpan span, String trimmed, int indent) {
     final body = trimmed.substring(1);
-    final nameMatch = RegExp(r'^([A-Za-z_$][\w$]*)').firstMatch(body);
+    final nameMatch = RegExp(r'^([A-Za-z_$][\w$-]*)').firstMatch(body);
     if (nameMatch == null) {
       throw PugParseException('Invalid mixin call', span);
     }
@@ -207,6 +308,15 @@ class PugParser {
     if (rest.startsWith('(')) {
       final result = _readBalanced(rest, 0, '(', ')');
       _parseAttributes(result.content, attrs, spreads);
+      rest = rest.substring(result.end + 1).trimLeft();
+    }
+    while (rest.startsWith('#') || rest.startsWith('.')) {
+      final prefix = rest[0];
+      final match = RegExp(r'^[.#]([\w-]+)').firstMatch(rest);
+      if (match == null) break;
+      attrs.add(PugAttribute(
+          prefix == '#' ? 'id' : 'class', "'${match.group(1)}'"));
+      rest = rest.substring(match.end);
     }
     return MixinCallNode(
         span, name, args, attrs, spreads, _parseNestedBlock(indent));

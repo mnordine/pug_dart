@@ -15,7 +15,6 @@ class PugRenderer {
   final SafeExpressionEvaluator evaluator;
   final Map<String, PugDocument> _cache = {};
   bool _htmlDoctype = false;
-
   String render(PugDocument document, Map<String, Object?> locals) {
     final scope = EvalScope({...locals});
     final html = _renderDocument(document, scope, null);
@@ -113,7 +112,9 @@ class PugRenderer {
   String _renderLocalAssignment(LocalAssignmentNode node, EvalScope scope) {
     if (!options.localAssignmentsEnabled) {
       throw UnsupportedFeatureException(
-        'Unbuffered assignment is unsupported: - var ${node.name} = ${node.expression}. Enable allowLocalAssignments or pass ${node.name} as a local.',
+        'Unbuffered assignment is unsupported: - var ${node.name} = '
+        '${node.expression}. Enable allowLocalAssignments or pass '
+        '${node.name} as a local.',
         node.span,
       );
     }
@@ -235,7 +236,8 @@ class PugRenderer {
           buffer.write(' ${entry.key}="${entry.key}"');
         }
       } else if (value is _RawAttribute) {
-        buffer.write(' ${entry.key}="${value.value ?? ''}"');
+        if (value.value == null || value.value == false) continue;
+        buffer.write(' ${entry.key}="${value.value}"');
       } else {
         buffer.write(' ${entry.key}="${escapeHtml('$value')}"');
       }
@@ -345,6 +347,9 @@ class PugRenderer {
     final path =
         options.effectiveLoader.resolve(node.path, from: node.span.filename);
     try {
+      if (!path.toLowerCase().endsWith('.pug')) {
+        return options.effectiveLoader.load(path, from: node.span.filename);
+      }
       return _renderDocument(_loadDocument(path), scope, blocks);
     } on PugIOException catch (error) {
       throw PugIOException(
@@ -459,7 +464,9 @@ class PugRenderer {
   }
 
   String _stringify(Object? value, {required bool escape}) {
-    final text = value?.toString() ?? '';
+    final text = value is num && value.isFinite && value == value.truncate()
+        ? value.toInt().toString()
+        : value?.toString() ?? '';
     return escape ? escapeHtml(text) : text;
   }
 

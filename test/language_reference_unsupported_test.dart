@@ -6,16 +6,20 @@ void main() {
     test('unbuffered JavaScript examples fail clearly', () {
       expect(
         () => pug.compile(
-            '- var authenticated = true\nbody(class=authenticated ? "authed" : "anon")'),
+            '- for (var x = 0; x < 3; x++)\n  li item'),
+        throwsA(isA<pug.UnsupportedFeatureException>()),
+      );
+      expect(
+        () => pug.compile(
+            '- var authenticated = true\nbody(class=authenticated ? "authed" : "anon")',
+            const pug.PugOptions()),
         returnsNormally,
       );
       expect(
         () => pug.render(
-            '- var authenticated = true\nbody(class=authenticated ? "authed" : "anon")'),
-        throwsA(isA<pug.UnsupportedFeatureException>()),
-      );
-      expect(
-        () => pug.compile('- for (var x = 0; x < 3; x++)\n  li item'),
+            '- var authenticated = true\nbody(class=authenticated ? "authed" : "anon")',
+            const {},
+            const pug.PugOptions()),
         throwsA(isA<pug.UnsupportedFeatureException>()),
       );
     });

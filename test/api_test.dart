@@ -69,6 +69,44 @@ p= product.tags.includes('spiced') ? String(product.tags.length) : Number('0')
     );
   });
 
+  test('node migration supports the Dart games template subset', () async {
+    final html = await pug.render(
+      '''
+mixin picture-item(name, types)
+  - name = name || 'fallback'
+  each type in types
+    - let srcset = [0.5, 1].map((ratio) => `images/\${name}@\${ratio * 2}x.\${type}`).join(', ')
+    source(srcset=srcset class!=attributes.class)
+
+-
+  var items = [
+    { name: 'logo', types: ['avif', 'webp'] },
+  ]
+
+each item in items
+  +picture-item(item.name, item.types).responsive
+''',
+      const {},
+      const pug.PugOptions(compatibility: pug.PugCompatibility.nodeMigration),
+    );
+    expect(
+      html,
+      '<source class="responsive" srcset="images/logo@1x.avif, images/logo@2x.avif"/>'
+      '<source class="responsive" srcset="images/logo@1x.webp, images/logo@2x.webp"/>',
+    );
+  });
+
+  test('non-Pug includes are rendered as raw text', () async {
+    final dir = Directory.systemTemp.createTempSync('pug_dart_raw_include_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final partial = File('${dir.path}/partial.html')
+      ..writeAsStringSync('<strong>Raw</strong>');
+    final template = File('${dir.path}/page.pug')
+      ..writeAsStringSync('include ${partial.path}');
+
+    expect(await pug.renderFile(template.path), '<strong>Raw</strong>');
+  });
+
   test('custom filters are explicit extension points', () async {
     final html = await pug.render(
       ':upper\n  hello',
