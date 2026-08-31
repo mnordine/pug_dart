@@ -563,8 +563,19 @@ const _voidTags = {
   'wbr',
 };
 
+final _prettyTokenPattern = RegExp(
+  r'<(pre|textarea|script|style)\b[^>]*>.*?</\1\s*>|<!--.*?-->|<![^>]*>|<[^>]+>|[^<]+',
+  caseSensitive: false,
+  dotAll: true,
+);
+final _prettyPreservedBlockPattern = RegExp(
+  r'^<(pre|textarea|script|style)\b[^>]*>.*?</\1\s*>$',
+  caseSensitive: false,
+  dotAll: true,
+);
+
 String prettyHtml(String html) {
-  final tokens = RegExp(r'<!--.*?-->|<![^>]*>|<[^>]+>|[^<]+', dotAll: true)
+  final tokens = _prettyTokenPattern
       .allMatches(html)
       .map((match) => match.group(0)!)
       .where((token) => token.isNotEmpty)
@@ -572,8 +583,12 @@ String prettyHtml(String html) {
   final buffer = StringBuffer();
   var indent = 0;
   for (final token in tokens) {
-    if (token.trim().isEmpty) continue;
-    if (token.startsWith('</')) {
+    if (_isPrettyPreservedBlock(token)) {
+      // Indent only the opening tag. Indenting or trimming the block's remaining lines would change the rendered text.
+      _writePrettyLine(buffer, indent, token);
+    } else if (token.trim().isEmpty) {
+      continue;
+    } else if (token.startsWith('</')) {
       indent = indent > 0 ? indent - 1 : 0;
       _writePrettyLine(buffer, indent, token);
     } else if (_isPrettyRawTag(token)) {
@@ -618,6 +633,18 @@ bool _isPrettyVoid(String token) {
 
 bool _isPrettyRawTag(String token) =>
     RegExp(r'^<(script|style)(\s|>)', caseSensitive: false).hasMatch(token);
+
+/// Whether [token] is a complete element whose text is whitespace-sensitive.
+///
+/// For example, pretty-printing must not change:
+///
+/// ```html
+/// <pre>By mail:
+/// Company Inc.</pre>
+/// ```
+///
+/// into `<pre>  By mail: ...</pre>`, because whitespace inside these elements is content rather than formatting.
+bool _isPrettyPreservedBlock(String token) => _prettyPreservedBlockPattern.hasMatch(token);
 
 String _collapsePrettyInlineText(String html) {
   var result = html;
